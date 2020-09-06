@@ -173,12 +173,14 @@ function _M.load()
     local_conf = core.config.local_conf(true)
 
     if ngx.config.subsystem == "http" then
+        -- 加载config-default.yaml文件的plugins属性中指定的插件并分别调用init方法，这些插件都定义在apisix/plugins目录
         local ok, err = load()
         if not ok then
             core.log.error("failed to load plugins: ", err)
         end
     end
 
+    -- 加载config-default.yaml文件的stream_plugins属性中指定的插件并分别调用init方法，这些插件都定义在apisix/stream/plugins目录
     local ok, err = load_stream()
     if not ok then
         core.log.error("failed to load stream plugins: ", err)
@@ -239,11 +241,13 @@ function _M.filter(user_route, plugins)
     end
 
     plugins = plugins or core.tablepool.fetch("plugins", 32, 0)
+    -- 遍历config-default.yaml文件定义的plugin对象
     for _, plugin_obj in ipairs(local_plugins) do
         local name = plugin_obj.name
         local plugin_conf = user_plugin_conf[name]
 
         if type(plugin_conf) == "table" and not plugin_conf.disable then
+            -- 保存plugin对象和其conf到plugins
             core.table.insert(plugins, plugin_obj)
             core.table.insert(plugins, plugin_conf)
         end
@@ -378,6 +382,7 @@ end
 
 
 function _M.init_worker()
+    -- 加载config-default.yaml文件中定义的插件
     _M.load()
 end
 

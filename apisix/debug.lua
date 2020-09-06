@@ -51,6 +51,7 @@ local function read_debug_yaml()
         return
     end
 
+    -- 打开conf/debug.yaml文件
     local f, err = io.open(debug_yaml_path, "r")
     if not f then
         log.error("failed to open file ", debug_yaml_path, " : ", err)
@@ -104,6 +105,7 @@ do
 local function apple_new_fun(module, fun_name, file_path, hook_conf)
     local log_level = hook_conf.log_level or "warn"
 
+    -- module对象实际上就是require("apisix")的返回值，也就是apisix/init.lua，这里检查该模块是否存在fun_name方法
     if not module or type(module[fun_name]) ~= "function" then
         log.error("failed to find function [", fun_name,
                   "] in module:", file_path)
@@ -172,13 +174,24 @@ function sync_debug_hooks()
         return
     end
 
+    -- 默认hooks的配置是：
+    -- hook_phase:
+    --   apisix:
+    --     - http_access_phase
+    --     - http_header_filter_phase
+    --     - http_body_filter_phase
+    --     - http_log_phase
+    -- 所以这里的file_path将是apisix，而fun_names将是上面的数组
     for file_path, fun_names in pairs(hooks) do
+        -- require("apisix")，根据nginx.conf文件的lua_package_path配置，实际加载的lua文件是apisix/init.lua
         local ok, module = pcall(require, file_path)
         if not ok then
             log.error("failed to load module [", file_path, "]: ", module)
 
         else
+            -- 遍历上面的数组
             for _, fun_name in ipairs(fun_names) do
+                -- module对象实际上就是require("apisix")的返回值
                 apple_new_fun(module, fun_name, file_path, hook_conf)
             end
         end
@@ -195,7 +208,10 @@ local function sync_debug_status(premature)
         return
     end
 
+    -- 读取conf/debug.yaml文件
     read_debug_yaml()
+    -- 根据conf/debug.yaml文件的配置初始化hook，hook的作用是在指定的module的方法被调用前后输出日志，实现原理是通过require调用获取到
+    -- module对象后，替换原来的方法，有点类似Java的动态代理
     sync_debug_hooks()
 end
 

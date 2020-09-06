@@ -70,10 +70,14 @@ function _M.http_init(args)
         seed = ngx_now() * 1000 + ngx.worker.pid()
     end
     math.randomseed(seed)
+    -- 解析dns_resolver参数
     parse_args(args)
+    -- 生成一个uuid保存到conf/apisix.uid文件
     core.id.init()
 
     local process = require("ngx.process")
+    -- 激活agent进程，该进程不监听服务端口，其继承了master进程的用户权限，可以向master进行发送信号，控制Nginx进行重载，关闭等操作
+    -- 特权进程需要执行的工作只能运行在init_worker_by_lua上下文中才有意义，因为不监听服务端口，没有请求触发，也就不会走到content、access等上下文去
     local ok, err = process.enable_privileged_agent()
     if not ok then
         core.log.error("failed to enable privileged_agent: ", err)
@@ -82,7 +86,12 @@ end
 
 
 function _M.http_init_worker()
+    -- 该模块基于共享内存实现了发送事件给其他worker的功能
+    -- 该模块自己会发送两个source="resty-worker-events"的事件：
+    -- event="started"：当模块第一次被配置时
+    -- event="stopping"：当worker进程退出时
     local we = require("resty.worker.events")
+    -- shm参数用于指定resty.worker.events模块使用的共享内存的名称
     local ok, err = we.configure({shm = "worker-events", interval = 0.1})
     if not ok then
         error("failed to init worker event: " .. err)
@@ -91,23 +100,36 @@ function _M.http_init_worker()
     if discovery and discovery.init_worker then
         discovery.init_worker()
     end
+    -- apisix.balancer.init_worker方法为空
     require("apisix.balancer").init_worker()
+    -- 保存apisix.balancer的run方法的引用，该方法用于根据route对象和请求的ctx实现从discovery中或者配置的upstream列表中选择上游服务并
+    -- 转发请求
     load_balancer = require("apisix.balancer").run
+    -- dashboard相关，暂时略
     require("apisix.admin.init").init_worker()
 
+    -- 执行路由模块的初始化
     router.http_init_worker()
+    -- 执行service模块的初始化
     require("apisix.http.service").init_worker()
+    -- 加载config-default.yaml文件中定义的插件
     plugin.init_worker()
+    -- 在etcd中创建/consumers目录
     require("apisix.consumer").init_worker()
 
+    -- 如果是基于yaml文件实现的配置持久化，则调用apisix.core.config_yaml模块的init_worker方法，默认使用的是etcd实现的持久化
     if core.config == require("apisix.core.config_yaml") then
         core.config.init_worker()
     end
 
+    -- 如果conf/debug.yaml文件配置的debug hook，则初始化这些hook，通过conf/debug.yaml文件能够实现在指定的module的指定方法被
+    -- 调用前后输出方法参数和方法返回值
     require("apisix.debug").init_worker()
+    -- 在etcd中创建/upstreams目录
     require("apisix.upstream").init_worker()
 
     local_conf = core.config.local_conf()
+    -- 从conf/config-default.yaml文件获取dns解析结果的有效期时间
     local dns_resolver_valid = local_conf and local_conf.apisix and
                         local_conf.apisix.dns_resolver_valid
 
@@ -156,10 +178,15 @@ end
 
 
 function _M.http_ssl_phase()
+    -- ngx.ctx是一个表，所以可以对他添加、修改。它用来存储基于请求的Lua环境数据，其生存周期与当前请求相同(类似Nginx变量)
+    -- 额外注意，每个请求，包括子请求，都有一份自己的ngx.ctx表
+    -- 与ngx.ctx很像的还有一个ngx.var，ngx.var是获取Nginx的变量，访问时需要经历字符串hash、hash表查找等过程，而ngx.ctx仅仅是一个
+    -- Lua table，它的引用存放在ngx_lua的模块上下文，所以如果都能满足要求，使用ngx.ctx比ngx.var往往是更好的选择
     local ngx_ctx = ngx.ctx
     local api_ctx = ngx_ctx.api_ctx
 
     if api_ctx == nil then
+        -- 从缓存池中获取table，作为api_ctx，该table的声明周期在一个请求内，用缓冲池创建table能够避免频繁的创建table，使得lua的gc繁忙
         api_ctx = core.tablepool.fetch("api_ctx", 0, 32)
         ngx_ctx.api_ctx = api_ctx
     end
@@ -333,30 +360,42 @@ function _M.http_access_phase()
     local api_ctx = ngx_ctx.api_ctx
 
     if not api_ctx then
+        -- 冲table池获取一个空的table，后面两个参数和table.new方法创建table时的含义是一样的，lua的table可以同时拥有数组部分和哈希部分，
+        -- table.new方法创建table时可以分别指定数组部分和哈希部分的初始大小
         api_ctx = core.tablepool.fetch("api_ctx", 0, 32)
         ngx_ctx.api_ctx = api_ctx
     end
 
+    -- 为api_ctx设置了var属性，同时为var属性设置了元表，对var获取属性时会对key做一些处理，同时会在ngx.var中找指定的key的值
     core.ctx.set_vars_meta(api_ctx)
 
+    -- 添加Server响应头
     core.response.set_header("Server", ver_header)
 
     -- load and run global rule
     if router.global_rules and router.global_rules.values
        and #router.global_rules.values > 0 then
+        -- 获取一个table
         local plugins = core.tablepool.fetch("plugins", 32, 0)
         local values = router.global_rules.values
+        -- config_util.iterate_values方法会逐个返回传入的table的属性中的table对象
         for _, global_rule in config_util.iterate_values(values) do
             api_ctx.conf_type = "global_rule"
             api_ctx.conf_version = global_rule.modifiedIndex
             api_ctx.conf_id = global_rule.value.id
 
             core.table.clear(plugins)
+            -- 遍历global_rule的plugins属性，这些属性设置了不同的plugin的conf，plugin.filter方法将config-default.yaml文件中定义
+            -- 的plugin对象和global_rule中配置的plugin conf一块保存到传入的plugins参数中，保存的方式如下：
+            -- core.table.insert(plugins, plugin_obj)
+            -- core.table.insert(plugins, plugin_conf)
             api_ctx.plugins = plugin.filter(global_rule, plugins)
+            -- 调用plugin的rewrite和access方法
             run_plugin("rewrite", plugins, api_ctx)
             run_plugin("access", plugins, api_ctx)
         end
 
+        -- global_rule的plugin在上面已经运行完了，这里就可以释放了
         core.tablepool.release("plugins", plugins)
         api_ctx.plugins = nil
         api_ctx.conf_type = nil
@@ -366,6 +405,7 @@ function _M.http_access_phase()
         api_ctx.global_rules = router.global_rules
     end
 
+    -- 如果需要，移除uri最后的/
     if local_conf.apisix and local_conf.apisix.delete_uri_tail_slash then
         local uri = api_ctx.var.uri
         if str_byte(uri, #uri) == str_byte("/") then
@@ -375,22 +415,27 @@ function _M.http_access_phase()
         end
     end
 
+    -- 尝试进行路由匹配，如果存在匹配的路由，对应的route对象将会被保存在api_ctx.matched_route
     router.router_http.match(api_ctx)
 
     core.log.info("matched route: ",
                   core.json.delay_encode(api_ctx.matched_route, true))
 
+    -- 获取匹配的route对象
     local route = api_ctx.matched_route
     if not route then
         return core.response.exit(404,
                     {error_msg = "failed to match any routes"})
     end
 
+    -- 如果是grpc调用，转发给grpc upstream
     if route.value.service_protocol == "grpc" then
         return ngx.exec("@grpc_pass")
     end
 
+    -- 如果route存在对应的service
     if route.value.service_id then
+        -- 根据service_id从etcd获取service
         local service = service_fetch(route.value.service_id)
         if not service then
             core.log.error("failed to fetch service configuration by ",
@@ -399,10 +444,13 @@ function _M.http_access_phase()
         end
 
         local changed
+        -- todo：合并conf的逻辑用到了一个自定义的lru逻辑，可以看看
         route, changed = plugin.merge_service_route(service, route)
+        -- 更新为合并后的route
         api_ctx.matched_route = route
 
         if changed then
+            -- 如果确实发生了合并，则合并下面的属性
             api_ctx.conf_type = "route&service"
             api_ctx.conf_version = route.modifiedIndex .. "&"
                                    .. service.modifiedIndex
@@ -414,14 +462,17 @@ function _M.http_access_phase()
             api_ctx.conf_id = service.value.id
         end
     else
+        -- 如果route没有指定service
         api_ctx.conf_type = "route"
         api_ctx.conf_version = route.modifiedIndex
         api_ctx.conf_id = route.value.id
     end
 
     local enable_websocket
+    -- 获取route对应的upstream id
     local up_id = route.value.upstream_id
     if up_id then
+        -- 获取route对应的upstream id
         local upstreams = core.config.fetch_created_obj("/upstreams")
         if upstreams then
             local upstream = upstreams:get(tostring(up_id))
@@ -430,12 +481,14 @@ function _M.http_access_phase()
                 return core.response.exit(500)
             end
 
+            -- 如果upstream的地址是域名
             if upstream.has_domain then
                 -- try to fetch the resolved domain, if we got `nil`,
                 -- it means we need to create the cache by handle.
                 -- the `api_ctx.conf_version` is different after we called
                 -- `parse_domain_in_up`, need to recreate the cache by new
                 -- `api_ctx.conf_version`
+                -- 解析域名
                 local parsed_upstream, err = lru_resolved_domain(upstream,
                                 upstream.modifiedIndex, return_direct, nil)
                 if err then
@@ -461,6 +514,10 @@ function _M.http_access_phase()
                 enable_websocket = true
             end
 
+            -- pass_host的值有以下几种：
+            -- pass：透传客户端请求的host
+            -- node：不透传客户端请求的host，使用upstream node配置的host
+            -- rewrite：使用upstream_host配置的值重写host
             if upstream.value.pass_host then
                 api_ctx.pass_host = upstream.value.pass_host
                 api_ctx.upstream_host = upstream.value.upstream_host
@@ -468,6 +525,8 @@ function _M.http_access_phase()
         end
 
     else
+        -- 当route没有指定upstream id时走下面的逻辑
+        -- 同上，解析upstream的域名
         if route.has_domain then
             local parsed_route, err = lru_resolved_domain(route, api_ctx.conf_version,
                                         return_direct, nil)
@@ -492,24 +551,34 @@ function _M.http_access_phase()
             enable_websocket = true
         end
 
+        -- 同上
         if route.value.upstream and route.value.upstream.pass_host then
             api_ctx.pass_host = route.value.upstream.pass_host
             api_ctx.upstream_host = route.value.upstream.upstream_host
         end
     end
 
+    -- 设置websocket相关的两个header的值到nginx变量，nginx.conf有如下配置：
+    -- proxy_set_header   Upgrade           $upstream_upgrade;
+    -- proxy_set_header   Connection        $upstream_connection;
+    -- 这样就支持了websocket
     if enable_websocket then
         api_ctx.var.upstream_upgrade    = api_ctx.var.http_upgrade
         api_ctx.var.upstream_connection = api_ctx.var.http_connection
     end
 
+    -- 如果route的script属性不为空，则将其作为函数执行，并将返回值保存到api_ctx的script_obj属性，返回值期望是一个对象，定义有若干方法
     if route.value.script then
         script.load(route, api_ctx)
+        -- 运行api_ctx.script_obj对象的access方法
         script.run("access", api_ctx)
     else
+        -- 这里的plugin.filter(route)当前方法的开始部分说过了，用于获取route的plugins属性定义的plugin，同时为plugin设置route配置的
+        -- plugin conf
         local plugins = plugin.filter(route)
         api_ctx.plugins = plugins
 
+        -- 执行plugin的rewrite方法
         run_plugin("rewrite", plugins, api_ctx)
         if api_ctx.consumer then
             local changed

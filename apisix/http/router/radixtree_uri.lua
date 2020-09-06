@@ -34,7 +34,9 @@ local _M = {version = 0.2}
 local function create_radixtree_router(routes)
     routes = routes or {}
 
+    -- 遍历实现了api方法的plugin，逐个调用plugin的api方法并返回所有的结果，plugin的api方法返回一个route配置
     local api_routes = plugin.api_routes()
+    -- OpenResty的一个worker是单线程的，所以uri_routes可以被重复使用，每次使用前clear一下就行了
     core.table.clear(uri_routes)
 
     for _, route in ipairs(api_routes) do
@@ -47,10 +49,13 @@ local function create_radixtree_router(routes)
         end
     end
 
+    -- 遍历保存在etcd中的route
     for _, route in ipairs(routes) do
         if type(route) == "table" then
             local filter_fun, err
             if route.value.filter_func then
+                -- loadstring函数的返回值是一个function，function的内容是传入的第一个字符串参数，第二个字符串参数只是在发生错误时
+                -- 作出提醒
                 filter_fun, err = loadstring(
                                         "return " .. route.value.filter_func,
                                         "router#" .. route.value.id)
@@ -60,11 +65,14 @@ local function create_radixtree_router(routes)
                     goto CONTINUE
                 end
 
+                -- 从上面loadstring的调用可以看出，filter_fun()的结果实际上就是route.value.filter_func，通过这一操作，使得
+                -- route.value.filter_func字符串变成了可以调用的lua函数
                 filter_fun = filter_fun()
             end
 
             core.log.info("insert uri route: ",
                           core.json.delay_encode(route.value))
+            -- 保存所有的route对象到uri_routes
             core.table.insert(uri_routes, {
                 paths = route.value.uris or route.value.uri,
                 methods = route.value.methods,
@@ -85,6 +93,7 @@ local function create_radixtree_router(routes)
     end
 
     core.log.info("route items: ", core.json.delay_encode(uri_routes, true))
+    -- uri_router引用和uri_routes一样也是重复使用
     uri_router = router.new(uri_routes)
 end
 
@@ -128,6 +137,7 @@ end
 
 function _M.init_worker(filter)
     local err
+    -- 在etcd中创建/routes目录
     user_routes, err = core.config.new("/routes", {
             automatic = true,
             item_schema = core.schema.route,

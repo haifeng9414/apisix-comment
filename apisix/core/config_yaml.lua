@@ -320,7 +320,9 @@ function _M.init_worker()
         return
     end
 
+    -- 读取conf/apisix.yaml文件到apisix_yaml
     read_apisix_yaml()
+    -- 定时刷新配置
     ngx.timer.every(1, read_apisix_yaml)
 end
 

@@ -18,6 +18,7 @@
 local log          = require("apisix.core.log")
 local local_conf   = require("apisix.core.config_local").local_conf()
 
+-- discovery参数用于设置服务发现的注册中心，默认只支持eureka
 local discovery_type = local_conf.apisix and local_conf.apisix.discovery
 local discovery
 

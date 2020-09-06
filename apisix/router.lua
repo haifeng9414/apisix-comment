@@ -71,19 +71,24 @@ function _M.http_init_worker()
     local router_http_name = "radixtree_uri"
     local router_ssl_name = "radixtree_sni"
 
+    -- 根据config-default.yaml文件的配置指定http router的实现和ssl router的实现
     if conf and conf.apisix and conf.apisix.router then
         router_http_name = conf.apisix.router.http or router_http_name
         router_ssl_name = conf.apisix.router.ssl or router_ssl_name
     end
 
     local router_http = require("apisix.http.router." .. router_http_name)
+    -- 对于默认实现apisix/http/router/radixtree_uri.lua，将会在etcd中创建/routes目录
     router_http.init_worker(filter)
+    -- 保存apisix/http/router/radixtree_uri.lua模块的引用，该模块基于基数树实现了路由匹配
     _M.router_http = router_http
 
     local router_ssl = require("apisix.http.router." .. router_ssl_name)
+    -- 对于默认实现apisix/http/router/radixtree_sni.lua，将会在etcd中创建/ssl目录
     router_ssl.init_worker()
     _M.router_ssl = router_ssl
 
+    -- 在etcd中创建/global_rules目录
     local global_rules, err = core.config.new("/global_rules", {
             automatic = true,
             item_schema = core.schema.global_rule

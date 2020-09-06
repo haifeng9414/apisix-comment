@@ -106,6 +106,7 @@ end
 
 function _M.init_worker()
     local err
+    -- 在etcd中创建/upstreams目录
     upstreams, err = core.config.new("/upstreams", {
             automatic = true,
             item_schema = core.schema.upstream,

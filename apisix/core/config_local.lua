@@ -118,7 +118,7 @@ local function merge_conf(base, new_tab, ppath)
     return base
 end
 
-
+-- 合并conf/config-default.yaml和conf/config.yaml的配置并返回
 function _M.local_conf(force)
     if not force and config_data then
         return config_data

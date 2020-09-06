@@ -293,6 +293,7 @@ function _M.init_worker()
     router = route.new(uri_route)
     events = require("resty.worker.events")
 
+    -- 注册callback函数reload_plugins，监听source为/apisix/admin/plugins/reload，event为PUT的事件
     events.register(reload_plugins, reload_event, "PUT")
 end
 

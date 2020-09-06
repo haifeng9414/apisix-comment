@@ -84,6 +84,7 @@ end
 
 function _M.init_worker()
     local err
+    -- 在etcd中创建/services目录
     services, err = core.config.new("/services", {
         automatic = true,
         item_schema = core.schema.service,

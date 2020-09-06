@@ -17,6 +17,8 @@
 #
 -->
 
+Fork from [apisix](https://github.com/apache/apisix)
+
 [Chinese](README_CN.md)
 ## APISIX
 
