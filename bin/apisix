@@ -33,11 +33,14 @@ local function excute_cmd(cmd)
     return data
 end
 
+-- 相当于创建/tmp/apisix_cores/目录，指定目录的mode为777
 excute_cmd("install -d -m 777 /tmp/apisix_cores/")
 
+-- 获取当前lua搜索文件的路径配置
 local pkg_cpath_org = package.cpath
 local pkg_path_org = package.path
 
+-- 添加依赖
 local apisix_home = "/usr/local/apisix"
 local pkg_cpath = apisix_home .. "/deps/lib64/lua/5.1/?.so;"
                   .. apisix_home .. "/deps/lib/lua/5.1/?.so;;"
@@ -46,6 +49,7 @@ local pkg_path  = apisix_home ..    "/deps/share/lua/5.1/?.lua;;"
 -- only for developer, use current folder as working space
 local is_root_path = false
 local script_path = arg[0]
+-- 判断当前目录是否是root目录，添加当前目录的deps文件夹到lua的搜索路径下
 if script_path:sub(1, 2) == './' then
     apisix_home = trim(excute_cmd("pwd"))
     if not apisix_home then
@@ -68,8 +72,10 @@ package.path  = pkg_path .. pkg_path_org
 
 do
     -- skip luajit environment
+    -- table.new是luajit的函数，通过执行pcall判断是否存在luajit环境
     local ok = pcall(require, "table.new")
     if not ok then
+        -- 判断是否存在cjson，存在则返回error
         local ok, json = pcall(require, "cjson")
         if ok and json then
             io.stderr:write("please remove the cjson library in Lua, it may "
@@ -601,33 +607,41 @@ end
 
 
 local function read_yaml_conf()
+    -- apisix.core.profile模块封装了将文件名称转换为对应的yaml文件路径的方法，同时支持根据APISIX_PROFILE环境变量返回对应的profile的
+    -- yaml文件路径
     local profile = require("apisix.core.profile")
     profile.apisix_home = apisix_home .. "/"
+    -- 获取conf目录下config-default.yaml文件的绝对路径
     local local_conf_path = profile:yaml_path("config-default")
     local default_conf_yaml, err = read_file(local_conf_path)
     if not default_conf_yaml then
         return nil, err
     end
 
+    -- 解析config-default.yaml文件，该文件保存了各种配置
     local default_conf = yaml.parse(default_conf_yaml)
     if not default_conf then
         return nil, "invalid config-default.yaml file"
     end
 
+    -- 获取conf目录下config.yaml文件的绝对路径
     local_conf_path = profile:yaml_path("config")
     local user_conf_yaml, err = read_file(local_conf_path)
     if not user_conf_yaml then
         return nil, err
     end
 
+    -- 判断config.yaml文件是否存在配置
     local is_empty_file = true
     for line in string.gmatch(user_conf_yaml .. '\n', '(.-)\r?\n') do
+        -- 判断是否只有空字符串或者以#开头
         if not is_empty_yaml_line(line) then
             is_empty_file = false
             break
         end
     end
 
+    -- 如果config.yaml文件不为空，则将该文件的配置覆盖到config-default.yaml文件对应的对象
     if not is_empty_file then
         local user_conf = yaml.parse(user_conf_yaml)
         if not user_conf then
@@ -731,19 +745,21 @@ version:    print the version of apisix
 ]])
 end
 
+-- 初始化conf/nginx.conf文件
 local function init()
     if is_root_path then
         print('Warning! Running apisix under /root is only suitable for development environments'
             .. ' and it is dangerous to do so. It is recommended to run APISIX in a directory other than /root.')
     end
 
-    -- read_yaml_conf
+    -- 返回根据conf/config-default.yaml文件解析到的配置对象
     local yaml_conf, err = read_yaml_conf()
     if not yaml_conf then
         error("failed to read local yaml config of apisix: " .. err)
     end
     -- print("etcd: ", yaml_conf.etcd.host)
 
+    -- 判断OpenResty是否存在http_stub_status_module模块，不存在则报错
     local or_ver = excute_cmd("openresty -V 2>&1")
     local with_module_status = true
     if or_ver and not or_ver:find("http_stub_status_module", 1, true) then
@@ -754,15 +770,19 @@ local function init()
     end
 
     local enabled_plugins = {}
+    -- 遍历config-default.yaml文件中设置的plugin属性
     for i, name in ipairs(yaml_conf.plugins) do
         enabled_plugins[name] = true
     end
 
+    -- 如果config-default.yaml文件的plugin属性存在proxy-cache插件，但是config-default.yaml文件中不存在proxy_cache相关配置，则
+    -- 报错
     if enabled_plugins["proxy-cache"] and not yaml_conf.apisix.proxy_cache then
         error("missing apisix.proxy_cache for plugin proxy-cache")
     end
 
     -- Using template.render
+    -- 保存各种变量和配置
     local sys_conf = {
         lua_path = pkg_path_org,
         lua_cpath = pkg_cpath_org,
@@ -787,6 +807,7 @@ local function init()
         sys_conf["worker_rlimit_core"] = "16G"
     end
 
+    -- 保存config-default.yaml文件中的配置到sys_conf
     for k,v in pairs(yaml_conf.apisix) do
         sys_conf[k] = v
     end
@@ -808,6 +829,7 @@ local function init()
         sys_conf["worker_processes"] = "auto"
     end
 
+    -- 判断是否设置了dns_resolver配置，如果没有则使用/etc/resolv.conf文件中的配置作为dns_resolver的值
     local dns_resolver = sys_conf["dns_resolver"]
     if not dns_resolver or #dns_resolver == 0 then
         local dns_addrs, err = local_dns_resolver("/etc/resolv.conf")
@@ -821,9 +843,11 @@ local function init()
         sys_conf["dns_resolver"] = dns_addrs
     end
 
+    -- 渲染ngx_tpl字符串
     local conf_render = template.compile(ngx_tpl)
     local ngxconf = conf_render(sys_conf)
 
+    -- 将渲染的结果作为nginx.conf文件
     local ok, err = write_file(apisix_home .. "/conf/nginx.conf", ngxconf)
     if not ok then
         error("failed to update nginx.conf: " .. err)
@@ -835,6 +859,7 @@ local function init()
         return
     end
 
+    -- 检查OpenResty的版本是否大于1.15.8
     local need_ver = "1.15.8"
     if not check_or_version(op_ver, need_ver) then
         io.stderr:write("openresty version must >=", need_ver, " current ", op_ver, "\n")
@@ -843,8 +868,10 @@ local function init()
 end
 _M.init = init
 
+-- 初始化etcd中的key
 local function init_etcd(show_output)
     -- read_yaml_conf
+    -- 从config-default.yaml文件解析etcd的配置
     local yaml_conf, err = read_yaml_conf()
     if not yaml_conf then
         error("failed to read local yaml config of apisix: " .. err)
@@ -874,6 +901,7 @@ local function init_etcd(show_output)
     local host_count = #(yaml_conf.etcd.host)
 
     -- check whether the user has enabled etcd v2 protocol
+    -- 检查当前连接的etcd是否支持v2版本
     for index, host in ipairs(yaml_conf.etcd.host) do
         uri = host .. "/v2/keys"
         local cmd = "curl -i -m ".. timeout * 2 .. " -o /dev/null -s -w %{http_code} " .. uri
@@ -890,6 +918,7 @@ local function init_etcd(show_output)
         local is_success = true
         uri = host .. "/v2/keys" .. (etcd_conf.prefix or "")
 
+        -- 如果etcd下没有下面这些key，则创建
         for _, dir_name in ipairs({"/routes", "/upstreams", "/services",
                                    "/plugins", "/consumers", "/node_status",
                                    "/ssl", "/global_rules", "/stream_routes",
@@ -995,4 +1024,5 @@ if not _M[cmd_action] then
     return
 end
 
+-- 执行命令行指定的方法，如./bin/apisix init将会执行init方法
 _M[cmd_action](arg[2])

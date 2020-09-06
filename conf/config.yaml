@@ -21,3 +21,6 @@
 #     host:
 #       - "http://127.0.0.1:2379"
 #
+nginx_config:                     # config for render the template to genarate nginx.conf
+  error_log: "logs/error.log"
+  error_log_level: "debug"
