@@ -327,10 +327,12 @@ end
 
 local function set_upstream_host(api_ctx)
     local pass_host = api_ctx.pass_host or "pass"
+    -- 如果pass_host的配置是pass，则不改变请求的host，直接透传
     if pass_host == "pass" then
         return
     end
 
+    -- 如果是rewrite表示使用upstream的upstream_host配置的值重写host
     if pass_host == "rewrite" then
         api_ctx.var.upstream_host = api_ctx.upstream_host
         return
@@ -338,17 +340,22 @@ local function set_upstream_host(api_ctx)
 
     -- only support single node for `node` mode currently
     local host
+    -- apisix/upstream.lua的set_by_route方法会将upstream的配置保存到api_ctx.upstream_conf
     local up_conf = api_ctx.upstream_conf
     local nodes_count = up_conf.nodes and #up_conf.nodes or 0
     if nodes_count == 1 then
         local node = up_conf.nodes[1]
+        -- 如果存在域名，则使用域名，域名属性在http_access_phase方法调用parse_domain_in_up或者parse_domain_in_route时设置的
+        -- 如果node的地址是ip而不是域名，则domain为空
         if node.domain and #node.domain > 0 then
             host = node.domain
         else
+            -- 使用upstream的ip地址
             host = node.host
         end
     end
 
+    -- 将node的地址作为之后请求转发给上游服务时的host，这个就是pass_host为node时的功能
     if host then
         api_ctx.var.upstream_host = host
     end
@@ -488,7 +495,7 @@ function _M.http_access_phase()
                 -- the `api_ctx.conf_version` is different after we called
                 -- `parse_domain_in_up`, need to recreate the cache by new
                 -- `api_ctx.conf_version`
-                -- 解析域名
+                -- 解析域名，先判断缓存中是否有
                 local parsed_upstream, err = lru_resolved_domain(upstream,
                                 upstream.modifiedIndex, return_direct, nil)
                 if err then
@@ -497,6 +504,7 @@ function _M.http_access_phase()
                 end
 
                 if not parsed_upstream then
+                    -- 解析upstream的nodes属性中的域名，保存解析的值到dns_value
                     parsed_upstream, err = parse_domain_in_up(upstream)
                     if err then
                         core.log.error("failed to reolve domain in upstream: ",
@@ -517,7 +525,7 @@ function _M.http_access_phase()
             -- pass_host的值有以下几种：
             -- pass：透传客户端请求的host
             -- node：不透传客户端请求的host，使用upstream node配置的host
-            -- rewrite：使用upstream_host配置的值重写host
+            -- rewrite：使用upstream的upstream_host配置的值重写host
             if upstream.value.pass_host then
                 api_ctx.pass_host = upstream.value.pass_host
                 api_ctx.upstream_host = upstream.value.upstream_host
@@ -573,6 +581,7 @@ function _M.http_access_phase()
         -- 运行api_ctx.script_obj对象的access方法
         script.run("access", api_ctx)
     else
+        -- 在script为空的情况下才会执行plugin
         -- 这里的plugin.filter(route)当前方法的开始部分说过了，用于获取route的plugins属性定义的plugin，同时为plugin设置route配置的
         -- plugin conf
         local plugins = plugin.filter(route)
@@ -580,8 +589,10 @@ function _M.http_access_phase()
 
         -- 执行plugin的rewrite方法
         run_plugin("rewrite", plugins, api_ctx)
+        -- consumer需要认证插件配合，而认证插件运行在access阶段，所以这里在执行插件的access阶段前判断consumer是否不为空
         if api_ctx.consumer then
             local changed
+            -- 合并配置
             route, changed = plugin.merge_consumer_route(
                 route,
                 api_ctx.consumer,
@@ -595,12 +606,14 @@ function _M.http_access_phase()
         run_plugin("access", plugins, api_ctx)
     end
 
+    -- 根据route的配置将upstream的配置保存到api_ctx
     local ok, err = set_upstream(route, api_ctx)
     if not ok then
         core.log.error("failed to parse upstream: ", err)
         core.response.exit(500)
     end
 
+    -- 根据配置设置upstream_host属性，也就是设置之后请求转发给上游服务时的host
     set_upstream_host(api_ctx)
 end
 

@@ -52,6 +52,7 @@ local _M = {
 
 local function fetch_health_nodes(upstream, checker)
     local nodes = upstream.nodes
+    -- 如果没有配置健康检查，则返回所有实例
     if not checker then
         local new_nodes = core.table.new(0, #nodes)
         for _, node in ipairs(nodes) do
@@ -61,6 +62,7 @@ local function fetch_health_nodes(upstream, checker)
         return new_nodes
     end
 
+    -- 返回健康的实例
     local host = upstream.checks and upstream.checks.active and upstream.checks.active.host
     local port = upstream.checks and upstream.checks.active and upstream.checks.active.port
     local up_nodes = core.table.new(0, #nodes)
@@ -103,6 +105,7 @@ local function create_checker(upstream, healthcheck_parent)
         end
     end
 
+    -- 如果upstream是直接配置在route的话，upstream.parent就是route_conf
     if upstream.parent then
         core.table.insert(upstream.parent.clean_handlers, function ()
             core.log.info("try to release checker: ", tostring(checker))
@@ -126,10 +129,12 @@ local function fetch_healthchecker(upstream, healthcheck_parent, version)
         return
     end
 
+    -- 如果已经创建过checker，直接返回
     if upstream.checker then
         return
     end
 
+    -- 从缓存中获取checker，没有则创建一个
     local checker = lrucache_checker(upstream, version,
                                      create_checker, upstream,
                                      healthcheck_parent)
@@ -159,11 +164,15 @@ end
 local function pick_server(route, ctx)
     core.log.info("route: ", core.json.delay_encode(route, true))
     core.log.info("ctx: ", core.json.delay_encode(ctx, true))
+    -- 获取上游服务的配置
     local up_conf = ctx.upstream_conf
+    -- 如果设置了服务名称，则尝试从注册中心获取实例
     if up_conf.service_name then
+        -- 如果没有设置discovery，则报错
         if not discovery then
             return nil, "discovery is uninitialized"
         end
+        -- 从discovery的实现中获取nodes，如eureka
         up_conf.nodes = discovery.nodes(up_conf.service_name)
     end
 
@@ -172,6 +181,7 @@ local function pick_server(route, ctx)
         return nil, "no valid upstream node"
     end
 
+    -- 设置timeout属性到balancer，如果不设置则会使用nginx.conf的配置
     if up_conf.timeout then
         local timeout = up_conf.timeout
         local ok, err = set_timeouts(timeout.connect, timeout.send,
@@ -181,6 +191,7 @@ local function pick_server(route, ctx)
         end
     end
 
+    -- 如果只有一个实例，直接使用
     if nodes_count == 1 then
         local node = up_conf.nodes[1]
         ctx.balancer_ip = node.host
@@ -188,55 +199,76 @@ local function pick_server(route, ctx)
         return node
     end
 
+    -- upstream_healthcheck_parent对象为保存在etcd中的upstream对象
     local healthcheck_parent = ctx.upstream_healthcheck_parent
+    -- 保存在etcd中的版本号
     local version = ctx.upstream_version
+    -- 格式为up_conf.type .. "#upstream_" .. up_id
     local key = ctx.upstream_key
+    -- 获取或创建upstream的健康检查实例
     local checker = fetch_healthchecker(up_conf, healthcheck_parent, version)
     ctx.up_checker = checker
 
+    -- 获取重试的次数，可以看到第一次执行就被设置成1了
     ctx.balancer_try_count = (ctx.balancer_try_count or 0) + 1
+    -- 更新健康检查统计信息
     if checker and ctx.balancer_try_count > 1 then
+        -- 获取上次失败的信息，state可能有两种值：
+        -- next：表示上次失败是因为上游服务返回了500以上的错误
+        -- failed：表示上次失败是因为连接上游服务失败
+        -- code为上次失败的响应码
         local state, code = get_last_failure()
         local host = up_conf.checks and up_conf.checks.active and up_conf.checks.active.host
         local port = up_conf.checks and up_conf.checks.active and up_conf.checks.active.port
         if state == "failed" then
             if code == 504 then
+                -- 报告一个timeout事件，这会影响checker的实例状态的统计信息
                 checker:report_timeout(ctx.balancer_ip, port or ctx.balancer_port, host)
             else
+                -- 报告一个连接失败事件，这会影响checker的实例状态的统计信息
                 checker:report_tcp_failure(ctx.balancer_ip, port or ctx.balancer_port, host)
             end
         else
+            -- 报告一个状态码，checker会根据状态码更新实例状态的统计信息
             checker:report_http_status(ctx.balancer_ip, port or ctx.balancer_port, host, code)
         end
     end
 
+    -- 如果是第一次执行
     if ctx.balancer_try_count == 1 then
+        -- 获取允许的重试次数
         local retries = up_conf.retries
         if not retries or retries < 0 then
             retries = #up_conf.nodes - 1
         end
 
+        -- 设置转发到上游服务允许的重试次数
         if retries > 0 then
             set_more_tries(retries)
         end
     end
 
     if checker then
+        -- status_ver可以认为是健康检查实例的版本号
         version = version .. "#" .. checker.status_ver
     end
 
+    -- 根据checker过滤掉不健康的实例，为健康的实例创建或获取实例选择器，由于version中带有checker的版本号，所以server_picker是可以缓存
+    -- 的
     local server_picker = lrucache_server_picker(key, version,
                             create_server_picker, up_conf, checker)
     if not server_picker then
         return nil, "failed to fetch server picker"
     end
 
+    -- 获取实例
     local server, err = server_picker.get(ctx)
     if not server then
         err = err or "no valid upstream node"
         return nil, "failed to find valid upstream server, " .. err
     end
 
+    -- 获取或解析地址解析结果
     local res, err = lrucache_addr(server, nil, parse_addr, server)
     ctx.balancer_ip = res.host
     ctx.balancer_port = res.port
@@ -255,12 +287,17 @@ _M.pick_server = pick_server
 
 
 function _M.run(route, ctx)
+    -- pick_server方法会执行健康检查和实例选择逻辑，最后会设置下面几个属性
+    -- ctx.balancer_ip = res.host
+    -- ctx.balancer_port = res.port
+    -- ctx.server_picker = server_picker
     local server, err = pick_server(route, ctx)
     if not server then
         core.log.error("failed to pick server: ", err)
         return core.response.exit(502)
     end
 
+    -- 转发请求
     core.log.info("proxy request to ", server.host, ":", server.port)
     local ok, err = balancer.set_current_peer(server.host, server.port)
     if not ok then

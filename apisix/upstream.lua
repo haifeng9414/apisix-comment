@@ -43,9 +43,13 @@ local function set_directly(ctx, key, ver, conf, parent)
         error("missing argument parent", 2)
     end
 
+    -- 从etcd获取到的upstream对象的value或者value经过dns解析后的dns_value
     ctx.upstream_conf = conf
+    -- upstream在etcd中的版本号
     ctx.upstream_version = ver
+    -- key为up_conf.type .. "#upstream_" .. up_id
     ctx.upstream_key = key
+    -- 从etcd获取到的upstream对象
     ctx.upstream_healthcheck_parent = parent
     return
 end
@@ -60,30 +64,36 @@ function _M.set_by_route(route, api_ctx)
     end
 
     local up_id = route.value.upstream_id
+    -- 如果route配置了upstream id
     if up_id then
         if not upstreams then
             return false, "need to create a etcd instance for fetching "
                           .. "upstream information"
         end
 
+        -- 获取id对应的upstream
         local up_obj = upstreams:get(tostring(up_id))
         if not up_obj then
             return false, "failed to find upstream by id: " .. up_id
         end
         core.log.info("upstream: ", core.json.delay_encode(up_obj))
 
+        -- dns_value指向已经dns解析后的结果，而value是原始的upstream配置
         local up_conf = up_obj.dns_value or up_obj.value
+        -- 保存传入的这些变量到api_ctx
         set_directly(api_ctx, up_conf.type .. "#upstream_" .. up_id,
                      up_obj.modifiedIndex, up_conf, up_obj)
         return true
     end
 
+    -- 如果没有配置upstream id，则从route上获取upstream配置
     local up_conf = (route.dns_value and route.dns_value.upstream)
                     or route.value.upstream
     if not up_conf then
         return false, "missing upstream configuration in Route or Service"
     end
 
+    -- 同上
     set_directly(api_ctx, up_conf.type .. "#route_" .. route.value.id,
                  api_ctx.conf_version, up_conf, route)
     return true
