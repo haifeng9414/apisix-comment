@@ -143,6 +143,7 @@ local function sync_data(self)
             return false, err
         end
 
+        -- headers会包含etcd的一些信息，其中最重要的是X-Etcd-Index属性，可以认为是版本号，用于表示watch时的起点
         local dir_res, headers = res.body.node, res.headers
         log.debug("readdir key: ", self.key, " res: ",
                   json.delay_encode(dir_res))
@@ -176,7 +177,9 @@ local function sync_data(self)
         self.values_hash = new_tab(0, #dir_res.nodes)
 
         local changed = false
+        -- 遍历数据
         for _, item in ipairs(dir_res.nodes) do
+            -- 去掉item.key的self.key前缀
             local key = short_key(self, item.key)
             local data_valid = true
             if type(item.value) ~= "table" then
@@ -186,6 +189,7 @@ local function sync_data(self)
                           ", it shoud be a object")
             end
 
+            -- 检查数据是否合法
             if data_valid and self.item_schema then
                 data_valid, err = check_schema(self.item_schema, item.value)
                 if not data_valid then
@@ -206,13 +210,16 @@ local function sync_data(self)
                 end
             end
 
+            -- 更新self.prev_index属性
             self:upgrade_version(item.modifiedIndex)
         end
 
+        -- 更新self.prev_index属性
         if headers then
             self:upgrade_version(headers["X-Etcd-Index"])
         end
 
+        -- 数据有变化时递增conf_version
         if changed then
             self.conf_version = self.conf_version + 1
         end
@@ -224,6 +231,7 @@ local function sync_data(self)
     -- for fetch the etcd index
     local key_res, _ = getkey(self.etcd_cli, self.key)
 
+    -- 长轮训等待etcd数据变化
     local dir_res, err = waitdir(self.etcd_cli, self.key, self.prev_index + 1, self.timeout)
 
     log.info("waitdir key: ", self.key, " prev_index: ", self.prev_index + 1)
@@ -240,6 +248,7 @@ local function sync_data(self)
         end
     end
 
+    -- timeout直接返回，_automatic_fetch方法会再次调用长轮训
     if not dir_res then
         return false, err
     end
@@ -247,6 +256,7 @@ local function sync_data(self)
     local res = dir_res.body.node
     local err_msg = dir_res.body.message
     if err_msg then
+        -- watch的版本太低了，重新reload
         if err_msg == "The event in requested index is outdated and cleared"
            and dir_res.body.errorCode == 401 then
             self.need_reload = true
@@ -258,6 +268,7 @@ local function sync_data(self)
     end
 
     if not res then
+        -- 同上
         if err == "The event in requested index is outdated and cleared" then
             self.need_reload = true
             log.warn("waitdir [", self.key, "] err: ", err,
@@ -269,6 +280,7 @@ local function sync_data(self)
     end
 
     local key = short_key(self, res.key)
+    -- 如果数据不合法
     if res.value and type(res.value) ~= "table" then
         self:upgrade_version(res.modifiedIndex)
         return false, "invalid item data of [" .. self.key .. "/" .. key
@@ -276,6 +288,7 @@ local function sync_data(self)
                       .. ", it shoud be a object"
     end
 
+    -- 检查数据是否合法
     if res.value and self.item_schema then
         local ok, err = check_schema(self.item_schema, res.value)
         if not ok then
@@ -300,9 +313,12 @@ local function sync_data(self)
         self.filter(res)
     end
 
+    -- 获取key对应的元素在self.values数组中的位置
     local pre_index = self.values_hash[key]
     if pre_index then
+        -- 获取之前的元素
         local pre_val = self.values[pre_index]
+        -- 调用clean回调
         if pre_val and pre_val.clean_handlers then
             for _, clean_handler in ipairs(pre_val.clean_handlers) do
                 clean_handler(pre_val)
@@ -310,17 +326,21 @@ local function sync_data(self)
             pre_val.clean_handlers = nil
         end
 
+        -- 更新value
         if res.value then
             res.value.id = key
             self.values[pre_index] = res
             res.clean_handlers = {}
 
         else
+            -- self.sync_times用于统计被删除的数据数量
             self.sync_times = self.sync_times + 1
+            -- 没有数据则清除元素
             self.values[pre_index] = false
         end
 
     elseif res.value then
+        -- 不满足if pre_index说明是新的数据，这里新增数据到self.values
         res.clean_handlers = {}
         insert_tab(self.values, res)
         self.values_hash[key] = #self.values
@@ -329,8 +349,10 @@ local function sync_data(self)
 
     -- avoid space waste
     -- todo: need to cover this path, it is important.
+    -- 如果被删除的数据超过100个，重新组织self.values数组
     if self.sync_times > 100 then
         local count = 0
+        -- 将非false的元素重新放到self.values
         for i = 1, #self.values do
             local val = self.values[i]
             self.values[i] = nil
@@ -340,6 +362,7 @@ local function sync_data(self)
             end
         end
 
+        -- 更新元素的self.values_hash，即更新数组位置信息
         for i = 1, count do
             key = short_key(self, self.values[i].key)
             self.values_hash[key] = i
@@ -374,7 +397,8 @@ function _M.getkey(self, key)
     return getkey(self.etcd_cli, key)
 end
 
-
+-- premature参数用于标识触发该回调的原因是否由于timer的到期。Nginx worker的退出，也会触发当前所有有效的timer。这时候premature会被设
+-- 置为true。回调函数需要正确处理这一参数（通常直接返回即可）
 local function _automatic_fetch(premature, self)
     if premature then
         return
@@ -383,6 +407,7 @@ local function _automatic_fetch(premature, self)
     local i = 0
     while not exiting() and self.running and i <= 32 do
         i = i + 1
+        -- pcall在保护模式下执行函数内容，同时捕获所有的异常和错误。若一切正常，pcall返回true以及被执行函数的返回值，否则返回nil和错误信息
         local ok, ok2, err = pcall(sync_data, self)
         if not ok then
             err = ok2

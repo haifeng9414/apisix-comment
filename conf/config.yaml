@@ -24,3 +24,6 @@
 nginx_config:                     # config for render the template to genarate nginx.conf
   error_log: "logs/error.log"
   error_log_level: "debug"
+
+apisix:
+  config_center: yaml

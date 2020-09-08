@@ -70,10 +70,12 @@ local function read_apisix_yaml(premature, pre_mtime)
 
     -- log.info("change: ", json.encode(attributes))
     local last_change_time = attributes.change
+    -- 如果修改时间没有变化直接返回
     if apisix_yaml_ctime == last_change_time then
         return
     end
 
+    log.info("read file ", apisix_yaml_path)
     local f, err = io.open(apisix_yaml_path, "r")
     if not f then
         log.error("failed to open file ", apisix_yaml_path, " : ", err)
@@ -92,6 +94,7 @@ local function read_apisix_yaml(premature, pre_mtime)
         end
     end
 
+    -- yaml文件必须以#END结尾
     if not found_end_flag then
         f:close()
         log.warn("missing valid end flag in file ", apisix_yaml_path)
@@ -108,6 +111,7 @@ local function read_apisix_yaml(premature, pre_mtime)
         return
     end
 
+    -- 保存yaml配置
     apisix_yaml = apisix_yaml_new
     apisix_yaml_ctime = last_change_time
 end
@@ -118,17 +122,21 @@ local function sync_data(self)
         return nil, "missing 'key' arguments"
     end
 
+    -- read_apisix_yaml方法会定时从yaml文件读取配置，apisix_yaml_ctime保存了上次读取文件时yaml的修改时间，如果apisix_yaml_ctime
+    -- 为空说明yaml文件还没有被读取，此时直接返回，等待读取
     if not apisix_yaml_ctime then
         log.warn("wait for more time")
         return nil, "failed to read local file " .. apisix_yaml_path
     end
 
+    -- 如果没有变化，直接返回
     if self.conf_version == apisix_yaml_ctime then
         return true
     end
 
     local items = apisix_yaml[self.key]
     log.info(self.key, " items: ", json.delay_encode(items))
+    -- key不存在对应的数据，直接返回
     if not items then
         self.values = new_tab(8, 0)
         self.values_hash = new_tab(0, 8)
@@ -166,6 +174,7 @@ local function sync_data(self)
         local conf_item = {value = item, modifiedIndex = apisix_yaml_ctime,
                            key = "/" .. self.key .. "/" .. key}
 
+        -- 验证数据合法性
         if data_valid and self.item_schema then
             data_valid, err = check_schema(self.item_schema, item)
             if not data_valid then
@@ -174,6 +183,7 @@ local function sync_data(self)
             end
         end
 
+        -- 保存数据到self.values
         if data_valid then
             insert_tab(self.values, conf_item)
             local item_id = conf_item.value.id or self.key .. "#" .. id
